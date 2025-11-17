@@ -1,0 +1,608 @@
+from fastapi import FastAPI, Depends, HTTPException, Request, Response, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.ext.asyncio import AsyncSession
+import logging
+import os
+from datetime import datetime, timedelta
+from typing import Optional, List
+import secrets
+import string
+import httpx
+from pydantic import BaseModel, EmailStr
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Auth Service", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# Import shared modules
+import sys
+sys.path.append('/app')
+from shared.database import get_session, create_db_and_tables
+from shared.models import User, Organization, EmailVerification, PasswordReset, OrganizationInvitation, InvitationStatus
+from shared.auth_utils import verify_password, get_password_hash
+from shared.cookie_auth import cookie_auth
+
+# Pydantic Models
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    full_name: str
+
+class UserResponse(BaseModel):
+    id: int
+    email: str
+    full_name: str
+    role: str
+    is_active: bool
+    is_verified: bool
+    organization_id: Optional[int]
+    created_at: datetime
+
+class VerifyEmailRequest(BaseModel):
+    email: EmailStr
+    code: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str
+
+class InvitationCreate(BaseModel):
+    email: EmailStr
+    role: str
+
+class AcceptInvitationRequest(BaseModel):
+    token: str
+    password: str
+    full_name: str
+
+@app.on_event("startup")
+async def startup_event():
+    await create_db_and_tables()
+
+# ==================== AUTHENTICATION ENDPOINTS ====================
+
+@app.post("/register")
+async def register(user_data: UserCreate, background_tasks: BackgroundTasks, response: Response):
+    """User registration with email verification"""
+    try:
+        async for session in get_session():
+            from sqlmodel import select
+            
+            # Check if user exists
+            result = await session.execute(select(User).where(User.email == user_data.email))
+            existing_user = result.scalar_one_or_none()
+            
+            if existing_user:
+                raise HTTPException(status_code=400, detail="Email already registered")
+            
+            # Create user
+            user = User(
+                email=user_data.email,
+                hashed_password=get_password_hash(user_data.password),
+                full_name=user_data.full_name,
+                role="ORG_OWNER",
+                is_verified=False
+            )
+            
+            session.add(user)
+            await session.commit()
+            await session.refresh(user)
+            
+            # Generate verification code
+            verification_code = ''.join(secrets.choice(string.digits) for _ in range(6))
+            expires_at = datetime.utcnow() + timedelta(hours=24)
+            
+            verification = EmailVerification(
+                email=user.email,
+                verification_code=verification_code,
+                expires_at=expires_at
+            )
+            
+            session.add(verification)
+            await session.commit()
+            
+            # Send verification email
+            background_tasks.add_task(send_verification_email, user.email, verification_code)
+            
+            # Create temporary access token
+            token_data = {"sub": user.email, "role": user.role, "temp": True}
+            access_token = cookie_auth.create_access_token(token_data)
+            cookie_auth.set_access_token_cookie(response, access_token)
+            
+            logger.info(f"✅ User registered: {user.email}")
+            
+            return {
+                "message": "Registration successful. Please check your email for verification code.",
+                "user_id": user.id,
+                "verification_required": True
+            }
+            
+    except Exception as e:
+        logger.error(f"❌ Registration failed: {e}")
+        raise HTTPException(status_code=500, detail="Registration failed")
+
+@app.post("/verify-email")
+async def verify_email(verify_data: VerifyEmailRequest, response: Response):
+    """Verify user email with code"""
+    try:
+        async for session in get_session():
+            from sqlmodel import select
+            
+            # Find verification record
+            result = await session.execute(
+                select(EmailVerification).where(
+                    EmailVerification.email == verify_data.email,
+                    EmailVerification.verification_code == verify_data.code,
+                    EmailVerification.used_at.is_(None),
+                    EmailVerification.expires_at > datetime.utcnow()
+                )
+            )
+            verification = result.scalar_one_or_none()
+            
+            if not verification:
+                raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+            
+            # Mark verification as used
+            verification.used_at = datetime.utcnow()
+            
+            # Mark user as verified
+            user_result = await session.execute(select(User).where(User.email == verify_data.email))
+            user = user_result.scalar_one_or_none()
+            
+            if user:
+                user.is_verified = True
+                await session.commit()
+                
+                # Create full access token
+                token_data = {"sub": user.email, "role": user.role, "org_id": user.organization_id}
+                access_token = cookie_auth.create_access_token(token_data)
+                cookie_auth.set_access_token_cookie(response, access_token)
+                
+                logger.info(f"✅ Email verified: {user.email}")
+                
+                return {
+                    "message": "Email verified successfully",
+                    "verified": True,
+                    "user": UserResponse(
+                        id=user.id,
+                        email=user.email,
+                        full_name=user.full_name,
+                        role=user.role,
+                        is_active=user.is_active,
+                        is_verified=user.is_verified,
+                        organization_id=user.organization_id,
+                        created_at=user.created_at
+                    )
+                }
+            
+            raise HTTPException(status_code=400, detail="User not found")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Email verification failed: {e}")
+        raise HTTPException(status_code=500, detail="Email verification failed")
+
+@app.post("/login")
+async def login(user_data: UserLogin, response: Response):
+    """User login"""
+    try:
+        async for session in get_session():
+            from sqlmodel import select
+            
+            result = await session.execute(select(User).where(User.email == user_data.email))
+            user = result.scalar_one_or_none()
+            
+            if not user or not verify_password(user_data.password, user.hashed_password):
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            
+            if not user.is_active:
+                raise HTTPException(status_code=401, detail="Account deactivated")
+            
+            if not user.is_verified:
+                raise HTTPException(status_code=401, detail="Email verification required")
+            
+            # Create tokens
+            token_data = {"sub": user.email, "role": user.role, "org_id": user.organization_id}
+            access_token = cookie_auth.create_access_token(token_data)
+            
+            # Set HTTP-only cookie
+            cookie_auth.set_access_token_cookie(response, access_token)
+            
+            logger.info(f"✅ User logged in: {user.email}")
+            
+            return {
+                "message": "Login successful",
+                "user": UserResponse(
+                    id=user.id,
+                    email=user.email,
+                    full_name=user.full_name,
+                    role=user.role,
+                    is_active=user.is_active,
+                    is_verified=user.is_verified,
+                    organization_id=user.organization_id,
+                    created_at=user.created_at
+                )
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Login failed: {e}")
+        raise HTTPException(status_code=500, detail="Login failed")
+
+@app.post("/logout")
+async def logout(response: Response):
+    """User logout"""
+    cookie_auth.clear_token_cookies(response)
+    return {"message": "Logout successful"}
+
+@app.get("/me")
+async def get_current_user(request: Request):
+    """Get current user info"""
+    try:
+        async for session in get_session():
+            user = await cookie_auth.get_current_user(request, session)
+            return {
+                "user": UserResponse(
+                    id=user.id,
+                    email=user.email,
+                    full_name=user.full_name,
+                    role=user.role,
+                    is_active=user.is_active,
+                    is_verified=user.is_verified,
+                    organization_id=user.organization_id,
+                    created_at=user.created_at
+                )
+            }
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+# ==================== PASSWORD RESET ENDPOINTS ====================
+
+@app.post("/forgot-password")
+async def forgot_password(forgot_data: ForgotPasswordRequest, background_tasks: BackgroundTasks):
+    """Request password reset"""
+    try:
+        async for session in get_session():
+            from sqlmodel import select
+            
+            # Check if user exists
+            result = await session.execute(select(User).where(User.email == forgot_data.email))
+            user = result.scalar_one_or_none()
+            
+            if not user:
+                # Don't reveal if user exists for security
+                return {"message": "If the email exists, a reset code has been sent"}
+            
+            # Generate reset code
+            reset_code = ''.join(secrets.choice(string.digits) for _ in range(6))
+            expires_at = datetime.utcnow() + timedelta(hours=1)
+            
+            # Create or update reset record
+            reset_result = await session.execute(
+                select(PasswordReset).where(PasswordReset.email == forgot_data.email)
+            )
+            existing_reset = reset_result.scalar_one_or_none()
+            
+            if existing_reset:
+                existing_reset.reset_code = reset_code
+                existing_reset.expires_at = expires_at
+                existing_reset.used_at = None
+            else:
+                reset = PasswordReset(
+                    email=forgot_data.email,
+                    reset_code=reset_code,
+                    expires_at=expires_at
+                )
+                session.add(reset)
+            
+            await session.commit()
+            
+            # Send reset email
+            background_tasks.add_task(send_password_reset_email, user.email, reset_code)
+            
+            logger.info(f"✅ Password reset requested: {user.email}")
+            
+            return {"message": "If the email exists, a reset code has been sent"}
+            
+    except Exception as e:
+        logger.error(f"❌ Password reset request failed: {e}")
+        raise HTTPException(status_code=500, detail="Password reset failed")
+
+@app.post("/reset-password")
+async def reset_password(reset_data: ResetPasswordRequest):
+    """Reset password with code"""
+    try:
+        async for session in get_session():
+            from sqlmodel import select
+            
+            # Find reset record
+            result = await session.execute(
+                select(PasswordReset).where(
+                    PasswordReset.email == reset_data.email,
+                    PasswordReset.reset_code == reset_data.code,
+                    PasswordReset.used_at.is_(None),
+                    PasswordReset.expires_at > datetime.utcnow()
+                )
+            )
+            reset_record = result.scalar_one_or_none()
+            
+            if not reset_record:
+                raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+            
+            # Mark reset as used
+            reset_record.used_at = datetime.utcnow()
+            
+            # Update user password
+            user_result = await session.execute(select(User).where(User.email == reset_data.email))
+            user = user_result.scalar_one_or_none()
+            
+            if user:
+                user.hashed_password = get_password_hash(reset_data.new_password)
+                await session.commit()
+                
+                logger.info(f"✅ Password reset: {user.email}")
+                
+                return {"message": "Password reset successfully"}
+            
+            raise HTTPException(status_code=400, detail="User not found")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Password reset failed: {e}")
+        raise HTTPException(status_code=500, detail="Password reset failed")
+
+# ==================== INVITATION ENDPOINTS ====================
+
+@app.post("/invitations")
+async def create_invitation(invitation_data: InvitationCreate, request: Request):
+    """Create organization invitation"""
+    try:
+        async for session in get_session():
+            user = await cookie_auth.get_current_user(request, session)
+            
+            if not user.organization_id:
+                raise HTTPException(status_code=400, detail="User must belong to an organization")
+            
+            # Check if user has permission to invite
+            if user.role not in ["org_owner", "org_admin"]:
+                raise HTTPException(status_code=403, detail="Insufficient permissions")
+            
+            # Check if user already exists in organization
+            existing_user_result = await session.execute(
+                select(User).where(
+                    User.email == invitation_data.email,
+                    User.organization_id == user.organization_id
+                )
+            )
+            if existing_user_result.scalar_one_or_none():
+                raise HTTPException(status_code=400, detail="User already in organization")
+            
+            # Generate invitation token
+            token = secrets.token_urlsafe(32)
+            expires_at = datetime.utcnow() + timedelta(days=7)
+            
+            invitation = OrganizationInvitation(
+                email=invitation_data.email,
+                role=invitation_data.role,
+                invited_by=user.id,
+                organization_id=user.organization_id,
+                token=token,
+                expires_at=expires_at
+            )
+            
+            session.add(invitation)
+            await session.commit()
+            
+            # Send invitation email
+            await send_invitation_email(invitation_data.email, token, user.organization_id)
+            
+            logger.info(f"✅ Invitation created for {invitation_data.email}")
+            
+            return {
+                "message": "Invitation sent successfully",
+                "invitation_id": invitation.id,
+                "expires_at": expires_at.isoformat()
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Invitation creation failed: {e}")
+        raise HTTPException(status_code=500, detail="Invitation creation failed")
+
+@app.get("/invitations/{token}")
+async def get_invitation(token: str):
+    """Get invitation details"""
+    try:
+        async for session in get_session():
+            from sqlmodel import select
+            
+            result = await session.execute(
+                select(OrganizationInvitation).where(
+                    OrganizationInvitation.token == token,
+                    OrganizationInvitation.status == InvitationStatus.PENDING,
+                    OrganizationInvitation.expires_at > datetime.utcnow()
+                )
+            )
+            invitation = result.scalar_one_or_none()
+            
+            if not invitation:
+                raise HTTPException(status_code=404, detail="Invalid or expired invitation")
+            
+            # Get organization details
+            org_result = await session.execute(
+                select(Organization).where(Organization.id == invitation.organization_id)
+            )
+            organization = org_result.scalar_one_or_none()
+            
+            return {
+                "invitation": {
+                    "email": invitation.email,
+                    "role": invitation.role,
+                    "organization_name": organization.name if organization else "Unknown",
+                    "expires_at": invitation.expires_at.isoformat()
+                }
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Get invitation failed: {e}")
+        raise HTTPException(status_code=500, detail="Get invitation failed")
+
+@app.post("/invitations/{token}/accept")
+async def accept_invitation(token: str, accept_data: AcceptInvitationRequest, response: Response):
+    """Accept organization invitation"""
+    try:
+        async for session in get_session():
+            from sqlmodel import select
+            
+            result = await session.execute(
+                select(OrganizationInvitation).where(
+                    OrganizationInvitation.token == token,
+                    OrganizationInvitation.status == InvitationStatus.PENDING,
+                    OrganizationInvitation.expires_at > datetime.utcnow()
+                )
+            )
+            invitation = result.scalar_one_or_none()
+            
+            if not invitation:
+                raise HTTPException(status_code=404, detail="Invalid or expired invitation")
+            
+            # Check if user already exists
+            user_result = await session.execute(select(User).where(User.email == invitation.email))
+            existing_user = user_result.scalar_one_or_none()
+            
+            if existing_user:
+                # User exists, add to organization
+                if existing_user.organization_id:
+                    raise HTTPException(status_code=400, detail="User already belongs to an organization")
+                
+                existing_user.organization_id = invitation.organization_id
+                existing_user.role = invitation.role
+            else:
+                # Create new user
+                user = User(
+                    email=invitation.email,
+                    hashed_password=get_password_hash(accept_data.password),
+                    full_name=accept_data.full_name,
+                    role=invitation.role,
+                    organization_id=invitation.organization_id,
+                    is_verified=True
+                )
+                session.add(user)
+                await session.commit()
+                await session.refresh(user)
+                existing_user = user
+            
+            # Update invitation status
+            invitation.status = InvitationStatus.ACCEPTED
+            invitation.accepted_at = datetime.utcnow()
+            
+            await session.commit()
+            
+            # Create access token
+            token_data = {"sub": existing_user.email, "role": existing_user.role, "org_id": existing_user.organization_id}
+            access_token = cookie_auth.create_access_token(token_data)
+            cookie_auth.set_access_token_cookie(response, access_token)
+            
+            logger.info(f"✅ Invitation accepted: {invitation.email}")
+            
+            return {
+                "message": "Invitation accepted successfully",
+                "user": UserResponse(
+                    id=existing_user.id,
+                    email=existing_user.email,
+                    full_name=existing_user.full_name,
+                    role=existing_user.role,
+                    is_active=existing_user.is_active,
+                    is_verified=existing_user.is_verified,
+                    organization_id=existing_user.organization_id,
+                    created_at=existing_user.created_at
+                )
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Accept invitation failed: {e}")
+        raise HTTPException(status_code=500, detail="Accept invitation failed")
+
+# ==================== UTILITY FUNCTIONS ====================
+
+async def send_verification_email(email: str, code: str):
+    """Send verification email via email service"""
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                "http://165.227.116.219:8010/send-verification",
+                json={"email": email, "code": code},
+                timeout=10.0
+            )
+    except Exception as e:
+        logger.error(f"❌ Failed to send verification email: {e}")
+
+async def send_password_reset_email(email: str, code: str):
+    """Send password reset email via email service"""
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                "http://165.227.116.219:8010/send-password-reset",
+                json={"email": email, "code": code},
+                timeout=10.0
+            )
+    except Exception as e:
+        logger.error(f"❌ Failed to send password reset email: {e}")
+
+async def send_invitation_email(email: str, token: str, organization_id: int):
+    """Send invitation email via email service"""
+    try:
+        async for session in get_session():
+            from sqlmodel import select
+            
+            org_result = await session.execute(select(Organization).where(Organization.id == organization_id))
+            organization = org_result.scalar_one_or_none()
+            
+            invitation_link = f"https://evidflow.com/accept-invitation?token={token}"
+            
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    "http://165.227.116.219:8010/send-invitation",
+                    json={
+                        "email": email,
+                        "organization_name": organization.name if organization else "Unknown",
+                        "invitation_link": invitation_link
+                    },
+                    timeout=10.0
+                )
+    except Exception as e:
+        logger.error(f"❌ Failed to send invitation email: {e}")
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "service": "auth",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/")
+async def root():
+    return {"message": "Auth Service is running"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
